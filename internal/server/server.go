@@ -35,6 +35,7 @@ import (
 	"github.com/wnddd839/codebuddy-proxy/internal/proxies"
 	"github.com/wnddd839/codebuddy-proxy/internal/sessionpin"
 	"github.com/wnddd839/codebuddy-proxy/internal/strutil"
+	"github.com/wnddd839/codebuddy-proxy/internal/systemprompt"
 	"github.com/wnddd839/codebuddy-proxy/internal/update"
 	"github.com/wnddd839/codebuddy-proxy/internal/usagejournal"
 	"github.com/wnddd839/codebuddy-proxy/internal/version"
@@ -1106,12 +1107,16 @@ func (s *Server) handleAdminAPI(w http.ResponseWriter, r *http.Request, path str
 	// system 提示词面板：模式热切换 / 实时事件流 / 按天历史回溯。
 	// 三个都是只读观测 + 一个模式开关，不碰账号与请求路径。
 	case path == "/direct-admin/api/system-prompt" && r.Method == http.MethodGet:
+		// 指标口径优先用「今天落盘」的全量统计（重启不清零）；
+		// 落盘不可用时才退回进程内近 24h，并用 statsScope 明确告诉前端当前口径。
+		stats, scope := s.systemPromptOverviewStats()
 		httputil.WriteJSON(w, http.StatusOK, map[string]any{
-			"ok":     true,
-			"mode":   config.NormalizeSystemPromptMode(s.Svc.Config().SystemPromptMode),
-			"stats":  s.Svc.SystemPromptJournal.Stats24h(time.Now()),
-			"recent": s.Svc.SystemPromptJournal.Recent(systemPromptRealtimeLimit),
-			"dates":  s.Svc.SystemPromptStore.Dates(),
+			"ok":         true,
+			"mode":       config.NormalizeSystemPromptMode(s.Svc.Config().SystemPromptMode),
+			"stats":      stats,
+			"statsScope": scope,
+			"recent":     s.Svc.SystemPromptJournal.Recent(systemPromptRealtimeLimit),
+			"dates":      s.Svc.SystemPromptStore.Dates(),
 		})
 		return
 	case path == "/direct-admin/api/system-prompt/events" && r.Method == http.MethodGet:
@@ -1810,6 +1815,25 @@ func (s *Server) setQuotaFloor(floor float64) (config.Config, error) {
 		CheckinRetryMax:            cfg.CheckinRetryMax,
 	}
 	return s.Svc.SetBehaviorSwitches(next), nil
+}
+
+// systemPromptOverviewStats 返回面板指标与口径标记。
+// 优先按今天落盘事件统计（与 06 历史页同源，重启不清零）；
+// 落盘读取失败则退回进程内近 24h，scope 标成 "memory"。
+func (s *Server) systemPromptOverviewStats() (systemprompt.Stats, string) {
+	if s == nil || s.Svc == nil {
+		return systemprompt.Stats{}, "memory"
+	}
+	date := time.Now().Format("20060102")
+	if store := s.Svc.SystemPromptStore; store != nil {
+		if stats, err := store.StatsForDate(date); err == nil {
+			return stats, "date:" + date
+		}
+	}
+	if journal := s.Svc.SystemPromptJournal; journal != nil {
+		return journal.Stats24h(time.Now()), "memory"
+	}
+	return systemprompt.Stats{}, "memory"
 }
 
 // System Prompt 面板的常量。首屏只要 200 条就够填满一屏，
