@@ -8,7 +8,7 @@ import (
 // UIRevision is the admin console markup/script stamp. Bump it on every
 // meaningful change to PageHTML so operators can tell the rebuilt binary
 // carries the new UI (independent of the release tag injected via ldflags).
-const UIRevision = "2026.11.09-v0.7.4"
+const UIRevision = "2026.11.15-v0.7.4"
 
 func PageHTML() string {
 	return `<!doctype html>
@@ -379,6 +379,10 @@ pre{
 .usage-filters{display:flex;flex-wrap:wrap;gap:16px 24px;margin:16px 0 0;align-items:end}
 .usage-filters label{display:flex;flex-direction:column;gap:6px;font-size:var(--fs-xs);letter-spacing:.12em;text-transform:uppercase;color:var(--fg-40)}
 .usage-filters select{width:220px;min-width:0;font-size:var(--fs-sm);text-transform:none;letter-spacing:0}
+/* 06 System Prompt：右侧的「只看问题 / 日期」小控件 */
+.sp-check{display:inline-flex;align-items:center;gap:6px;font-size:var(--fs-xs);letter-spacing:.12em;text-transform:uppercase;color:var(--fg-40)}
+.sp-check select{min-width:0;font-size:var(--fs-sm);text-transform:none;letter-spacing:0}
+.sp-check input[type="checkbox"]{margin:0}
 .usage-models{margin-top:16px;overflow:auto;border:1px solid var(--fg-10)}
 .usage-models table{width:100%;border-collapse:collapse;font-size:var(--fs-sm)}
 .usage-models th,.usage-models td{padding:8px 12px;border-bottom:1px solid var(--fg-10);text-align:left}
@@ -593,8 +597,11 @@ button:disabled{opacity:.4;cursor:not-allowed}
     <button type="button" class="tab-link" data-tab="tab-models">
       <span class="tab-idx">05 /</span> 模型与路由
     </button>
+    <button type="button" class="tab-link" data-tab="tab-system-prompt">
+      <span class="tab-idx">06 /</span> System Prompt
+    </button>
     <button type="button" class="tab-link" data-tab="tab-usage">
-      <span class="tab-idx">06 /</span> 用量与明细
+      <span class="tab-idx">07 /</span> 用量与明细
     </button>
   </nav>
 
@@ -1058,7 +1065,121 @@ button:disabled{opacity:.4;cursor:not-allowed}
   </div>
 
   <!-- ========================================================
-       TAB 05: 用量与明细
+       TAB 06: System Prompt（开发者面板）
+       ======================================================== -->
+  <div class="tab-panel" id="tab-system-prompt">
+    <section class="panel">
+      <div class="panel-inner">
+        <div class="eyebrow">System Prompt · Developer Panel</div>
+        <h1>system 提示词处理</h1>
+        <p class="lede">
+          三档模式热切换，并实时看每次请求的 system 形态。事件只记 SHA-256 前 8 位指纹与字节数，
+          <strong>不保存 system / user 原文</strong>。历史按天写入 <code>proxy-systemprompt-YYYYMMDD.jsonl</code>，保留 7 天。
+        </p>
+
+        <div class="section-head" style="margin-top:20px;border:none;padding:0">
+          <div class="seg" id="spModeSeg" role="group" aria-label="system 提示词模式">
+            <button type="button" data-mode="auto" class="active">auto · 原样优先</button>
+            <button type="button" data-mode="keep">keep · 永远原样</button>
+            <button type="button" data-mode="fold">fold · 永远折叠</button>
+          </div>
+          <div class="actions">
+            <label class="sp-check"><input type="checkbox" id="spOnlyProblems"/> 只看问题</label>
+            <button class="ghost" id="btnRefreshSp" type="button">刷新</button>
+          </div>
+        </div>
+        <p class="checkin-hint" id="spModeHint">
+          auto：原样优先，上游以 11128 拒收时自动折叠重试一次（不罚号、不换号）。
+          keep：永远原样，被拦截就如实报错。fold：永远折叠成 <code>&lt;client_instructions&gt;</code>。
+        </p>
+
+        <div class="metrics">
+          <div class="metric"><div class="k">近 24h 事件</div><div class="v" id="spTotal">0</div></div>
+          <div class="metric"><div class="k">keep</div><div class="v" id="spKeep">0</div></div>
+          <div class="metric"><div class="k">fold</div><div class="v" id="spFold">0</div></div>
+          <div class="metric"><div class="k">降级</div><div class="v" id="spDegraded">0</div></div>
+          <div class="metric"><div class="k">被拦截</div><div class="v" id="spBlocked">0</div></div>
+          <div class="metric"><div class="k">失败</div><div class="v" id="spFailed">0</div></div>
+        </div>
+
+        <div class="section-head">
+          <div>
+            <h2>实时事件流</h2>
+            <p>内存保留最近 500 条，首屏回 200 条；每 5 秒自动刷新，页面切到后台时暂停。</p>
+          </div>
+        </div>
+        <div class="log-table-wrap">
+          <div class="log-table-window">
+            <table class="log-table" aria-label="system 提示词实时事件">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>请求 ID</th>
+                  <th>模式</th>
+                  <th>形态</th>
+                  <th>指纹</th>
+                  <th>system 字节</th>
+                  <th>账号</th>
+                  <th>模型</th>
+                  <th>耗时</th>
+                  <th>结果</th>
+                </tr>
+              </thead>
+              <tbody id="spRealtimeRows">
+                <tr><td colspan="10" class="empty" style="border:none">加载中…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="section-head">
+          <div>
+            <h2>历史回溯</h2>
+            <p>按天读取已落盘的事件。日期列表来自磁盘上现存的文件。</p>
+          </div>
+          <div class="actions">
+            <label class="sp-check">日期 <select id="spDateSelect" aria-label="选择日期"></select></label>
+            <button type="button" class="ghost" id="btnSpPrev" disabled>上一页</button>
+            <button type="button" class="ghost" id="btnSpNext" disabled>下一页</button>
+          </div>
+        </div>
+        <div class="log-table-wrap">
+          <div class="log-table-window">
+            <table class="log-table" aria-label="system 提示词历史事件">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>请求 ID</th>
+                  <th>模式</th>
+                  <th>形态</th>
+                  <th>指纹</th>
+                  <th>system 字节</th>
+                  <th>账号</th>
+                  <th>模型</th>
+                  <th>耗时</th>
+                  <th>结果</th>
+                </tr>
+              </thead>
+              <tbody id="spHistoryRows">
+                <tr><td colspan="10" class="empty" style="border:none">选择日期后加载</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="log-pager">
+            <span id="spPagerMeta">—</span>
+          </div>
+        </div>
+
+        <p class="checkin-hint" id="spPrivacyHint">
+          隐私自检：<code>sudo grep -c "You are Claude Code" /opt/buddy-proxy/proxy-systemprompt-*.jsonl</code> 应恒为
+          <code>0</code>。事件里的指纹无法反推原文，只用于判断「同一个 system 出现了几次」。
+        </p>
+      </div>
+    </section>
+  </div>
+
+  <!-- ========================================================
+       TAB 07: 用量与明细
        ======================================================== -->
   <div class="tab-panel" id="tab-usage">
     <section class="panel">
@@ -1117,6 +1238,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
                   <th>上游 Request</th>
                   <th>会话</th>
                   <th>模型</th>
+                  <th>System</th>
                   <th>Token 总量</th>
                   <th>缓存命中</th>
                   <th>Credit</th>
@@ -1126,7 +1248,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
                 </tr>
               </thead>
               <tbody id="usageRows">
-                <tr><td colspan="11" class="empty" style="border:none">加载中…</td></tr>
+                <tr><td colspan="12" class="empty" style="border:none">加载中…</td></tr>
               </tbody>
             </table>
           </div>
@@ -1204,7 +1326,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 const $ = (id) => document.getElementById(id);
 
 /* Six chapters, with legacy anchors retained for saved links and OAuth callbacks. */
-const chapterHashes = {'tab-overview':'#overview','tab-pool':'#accounts','tab-checkin':'#checkin','tab-client':'#client-config','tab-models':'#models','tab-usage':'#usage'};
+const chapterHashes = {'tab-overview':'#overview','tab-pool':'#accounts','tab-checkin':'#checkin','tab-client':'#client-config','tab-models':'#models','tab-system-prompt':'#system-prompt','tab-usage':'#usage'};
 function switchTab(tabId, updateHash=true){
   if (!chapterHashes[tabId]) tabId = 'tab-overview';
   document.querySelectorAll('.tab-link').forEach(function(b){
@@ -1236,12 +1358,14 @@ function openChapterHash(){
   if (hash === '#tab-checkin') tab = 'tab-checkin';
   switchTab(tab || 'tab-overview', false);
   if (tab === 'tab-usage') refreshUsage().catch(function(e){ showToast(e.message,'error'); });
+  if (tab === 'tab-system-prompt') refreshSystemPrompt().catch(function(e){ showToast(e.message,'error'); });
   if (hash === '#codebuddy' || hash === '#quota-floor') requestAnimationFrame(function(){ $(hash.slice(1)).scrollIntoView(); });
 }
 document.querySelectorAll('.tab-link').forEach(function(btn){
   btn.addEventListener('click', function(){
     switchTab(btn.getAttribute('data-tab'));
     if (btn.getAttribute('data-tab') === 'tab-usage') refreshUsage().catch(function(e){ showToast(e.message,'error'); });
+    if (btn.getAttribute('data-tab') === 'tab-system-prompt') refreshSystemPrompt().catch(function(e){ showToast(e.message,'error'); });
   });
   btn.addEventListener('keydown',function(e){
     const tabs = Array.from(document.querySelectorAll('.tab-link'));
@@ -1729,6 +1853,16 @@ function rowHitRate(row){
   if (p <= 0) return -1;
   return (row.cachedTokens || 0) / p * 100;
 }
+// systemCell 渲染 07 用量明细的 System 列。
+// 旧条目没有 systemForm（omitempty），显示 — 而不是假装 fold。
+function systemCell(row){
+  const form = row.systemForm || '';
+  if (!form) return '<span style="color:var(--fg-40)">—</span>';
+  const label = row.systemDegraded ? (form + '(降级)') : form;
+  const cls = row.systemDegraded ? 'warn' : (form === 'keep' ? 'on' : 'muted');
+  const title = row.systemFp ? (' title="指纹 ' + escapeHtml(row.systemFp) + '"') : '';
+  return '<span class="badge ' + cls + '"' + title + '>' + escapeHtml(label) + '</span>';
+}
 function paintUsageChart(series, summary){
   const host = $('usageChart');
   if (!host) return;
@@ -1797,7 +1931,7 @@ function paintUsage(data){
   const tbody = $('usageRows');
   if (!tbody) return;
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="11" style="color:var(--fg-40);padding:24px;text-align:center">暂无记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="12" style="color:var(--fg-40);padding:24px;text-align:center">暂无记录</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(function(row){
@@ -1817,6 +1951,7 @@ function paintUsage(data){
       '<td class="mono">' + (upReq ? '<button type="button" class="idbtn" data-copy="' + escapeHtml(upReq) + '">' + escapeHtml(shortId(upReq)) + '</button>' : '—') + '</td>' +
       '<td>' + session + '</td>' +
       '<td class="mono">' + escapeHtml(row.model || '—') + '</td>' +
+      '<td class="mono">' + systemCell(row) + '</td>' +
       '<td class="mono">' + String(totalTok) + '</td>' +
       '<td class="mono">' + escapeHtml(hit) + '</td>' +
       '<td class="mono">' + escapeHtml(credit) + '</td>' +
@@ -1845,6 +1980,144 @@ function paintUsagePager(data){
   if (prev) prev.disabled = usagePage <= 1;
   if (next) next.disabled = usagePage >= pages || total === 0;
 }
+/* ============================================================
+   06 System Prompt — 开发者面板
+   三档模式热切换 + 实时事件流 + 按天历史。
+   事件只有指纹与字节数，绝不发明文。
+   ============================================================ */
+let spMode = 'auto';
+let spHistory = {date:'', page:1, size:100, total:0, hasMore:false};
+
+function spResultLabel(e){
+  if (e.degraded) return '<span class="badge warn" title="11128 被拦截后自动折叠重试成功">降级成功</span>';
+  if (e.errorCode === '11128') return '<span class="badge bad">被拦截 · 11128</span>';
+  if (e.status === 0) return '<span class="badge off" title="传输层失败：建连或首内容前断流">传输失败</span>';
+  if (e.status >= 400) return '<span class="badge off">失败 · ' + escapeHtml(String(e.status)) + '</span>';
+  if (e.errorCode) return '<span class="badge off">' + escapeHtml(e.errorCode) + '</span>';
+  return '<span class="badge on">OK</span>';
+}
+function spRowsHtml(rows, emptyText){
+  if (!rows || !rows.length){
+    return '<tr><td colspan="10" style="color:var(--fg-40);padding:24px;text-align:center">' + escapeHtml(emptyText) + '</td></tr>';
+  }
+  return rows.map(function(e){
+    const id = e.requestId || '';
+    const fp = e.fingerprint ? escapeHtml(e.fingerprint) : '<span style="color:var(--fg-40)">—</span>';
+    const len = e.systemLen ? String(e.systemLen) : '—';
+    const dur = (e.durationMs != null) ? (e.durationMs + 'ms') : '—';
+    const formBadge = (e.form === 'keep') ? 'on' : 'muted';
+    return '<tr>' +
+      '<td class="mono">' + escapeHtml(formatTime(e.at)) + '</td>' +
+      '<td class="mono">' + (id ? '<button type="button" class="idbtn" data-copy="' + escapeHtml(id) + '">' + escapeHtml(shortId(id)) + '</button>' : '—') + '</td>' +
+      '<td class="mono">' + escapeHtml(e.mode || '—') + '</td>' +
+      '<td><span class="badge ' + formBadge + '">' + escapeHtml(e.form || '—') + '</span></td>' +
+      '<td class="mono">' + fp + '</td>' +
+      '<td class="mono">' + len + '</td>' +
+      '<td>' + escapeHtml(e.accountId ? shortId(e.accountId) : '—') + '</td>' +
+      '<td class="mono">' + escapeHtml(e.model || '—') + '</td>' +
+      '<td class="mono">' + dur + '</td>' +
+      '<td>' + spResultLabel(e) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+function paintSpMode(){
+  const seg = $('spModeSeg');
+  if (seg) seg.querySelectorAll('button[data-mode]').forEach(function(b){
+    b.classList.toggle('active', b.getAttribute('data-mode') === spMode);
+  });
+}
+function fillSpDates(dates){
+  const sel = $('spDateSelect');
+  if (!sel) return;
+  const keep = spHistory.date || ((dates && dates.length) ? dates[dates.length - 1] : '');
+  const list = (dates || []).slice();
+  if (keep && list.indexOf(keep) < 0) list.push(keep);
+  if (!list.length) list.push(new Date().toISOString().slice(0,10).replace(/-/g,''));
+  list.sort();
+  sel.innerHTML = list.map(function(d){
+    const pretty = d.length === 8 ? (d.slice(0,4) + '-' + d.slice(4,6) + '-' + d.slice(6,8)) : d;
+    return '<option value="' + escapeHtml(d) + '"' + (d === keep ? ' selected' : '') + '>' + escapeHtml(pretty) + '</option>';
+  }).join('');
+}
+async function refreshSystemPrompt(){
+  const data = await api('/direct-admin/api/system-prompt');
+  spMode = data.mode || 'auto';
+  paintSpMode();
+  const stats = data.stats || {};
+  $('spTotal').textContent = String(stats.total || 0);
+  $('spKeep').textContent = String(stats.keep || 0);
+  $('spFold').textContent = String(stats.fold || 0);
+  $('spDegraded').textContent = String(stats.degraded || 0);
+  $('spBlocked').textContent = String(stats.blocked || 0);
+  $('spFailed').textContent = String(stats.failed || 0);
+  const tbody = $('spRealtimeRows');
+  if (tbody) tbody.innerHTML = spRowsHtml(data.recent || [], '暂无事件（只有带 system 的请求才会记录）');
+  if (!spHistory.date) spHistory.date = (data.dates && data.dates.length) ? data.dates[data.dates.length - 1] : '';
+  fillSpDates(data.dates || []);
+  return data;
+}
+async function refreshSpHistory(){
+  const sel = $('spDateSelect');
+  if (sel && sel.value) spHistory.date = sel.value;
+  if (!spHistory.date) return;
+  let url = '/direct-admin/api/system-prompt/events?date=' + encodeURIComponent(spHistory.date) +
+    '&page=' + spHistory.page + '&size=' + spHistory.size;
+  if ($('spOnlyProblems') && $('spOnlyProblems').checked) url += '&onlyProblems=1';
+  const data = await api(url);
+  spHistory.total = data.total || 0;
+  spHistory.hasMore = !!data.hasMore;
+  const tbody = $('spHistoryRows');
+  if (tbody) tbody.innerHTML = spRowsHtml(data.events || [], '这一天没有事件');
+  const meta = $('spPagerMeta');
+  if (meta){
+    const from = spHistory.total === 0 ? 0 : ((spHistory.page - 1) * spHistory.size + 1);
+    const to = Math.min(spHistory.page * spHistory.size, spHistory.total);
+    meta.textContent = spHistory.total + ' 条 · ' + from + '–' + to + ' · 第 ' + spHistory.page + ' 页 · ' + (data.date || spHistory.date);
+  }
+  if ($('btnSpPrev')) $('btnSpPrev').disabled = spHistory.page <= 1;
+  if ($('btnSpNext')) $('btnSpNext').disabled = !spHistory.hasMore;
+  return data;
+}
+async function spSwitchMode(mode){
+  if (mode === spMode) return;
+  const data = await api('/direct-admin/api/system-prompt', {method:'POST', body: JSON.stringify({mode: mode})});
+  spMode = data.mode || mode;
+  paintSpMode();
+  showToast('system 模式已切换：' + spMode);
+  await refreshSystemPrompt();
+}
+function spTick(){
+  // 页面切到后台就不再轮询：省手机流量，也避免无意义的请求淹没真实流量。
+  if (document.visibilityState === 'hidden') return;
+  const panel = $('tab-system-prompt');
+  if (!panel || !panel.classList.contains('active')) return;
+  refreshSystemPrompt().catch(function(){});
+  refreshSpHistory().catch(function(){});
+}
+document.querySelectorAll('#spModeSeg button[data-mode]').forEach(function(b){
+  b.addEventListener('click', function(){
+    spSwitchMode(b.getAttribute('data-mode')).catch(function(e){ showToast(e.message,'error'); });
+  });
+});
+if ($('btnRefreshSp')) $('btnRefreshSp').addEventListener('click', function(){
+  refreshSystemPrompt().then(function(){ return refreshSpHistory(); }).catch(function(e){ showToast(e.message,'error'); });
+});
+if ($('spOnlyProblems')) $('spOnlyProblems').addEventListener('change', function(){
+  spHistory.page = 1;
+  refreshSpHistory().catch(function(e){ showToast(e.message,'error'); });
+});
+if ($('spDateSelect')) $('spDateSelect').addEventListener('change', function(){
+  spHistory.page = 1;
+  refreshSpHistory().catch(function(e){ showToast(e.message,'error'); });
+});
+if ($('btnSpPrev')) $('btnSpPrev').addEventListener('click', function(){
+  if (spHistory.page > 1){ spHistory.page--; refreshSpHistory().catch(function(e){ showToast(e.message,'error'); }); }
+});
+if ($('btnSpNext')) $('btnSpNext').addEventListener('click', function(){
+  if (spHistory.hasMore){ spHistory.page++; refreshSpHistory().catch(function(e){ showToast(e.message,'error'); }); }
+});
+setInterval(spTick, 5000);
+
 async function refreshUsage(){
   const offset = (usagePage - 1) * usagePageSize;
   let url = '/direct-admin/api/usage?range=' + encodeURIComponent(usageRange) +
