@@ -153,6 +153,10 @@ type ChatOptions struct {
 	DeliverToolDeltas bool
 	// Proxy 是该请求使用的出口（账号级绑定）。空 = 直连。
 	Proxy string
+	// KeepSystem 为 true 时原样透传客户端 system（auto / keep 模式）。
+	KeepSystem bool
+	// FoldedRetry 表示本请求已经因 11128 降级过一次，防止无限重试。
+	FoldedRetry bool
 }
 
 type Event struct {
@@ -689,6 +693,19 @@ func NormalizeMessageRole(role string) string {
 const canonicalUpstreamSystem = "You are a helpful coding assistant."
 
 func EnsureUpstreamMessages(messages []map[string]any) []map[string]any {
+	return EnsureUpstreamMessagesWith(messages, false)
+}
+
+// EnsureUpstreamMessagesWith 规整客户端消息。
+//
+// keepSystem=false（默认，fold 模式）：把客户端 system/developer 折叠进第一条
+// user 的 <client_instructions>，首条换成 canonicalUpstreamSystem。这是历史行为，
+// 用于绕开上游 11128（竞品 CLI 指纹扫描）。
+//
+// keepSystem=true（auto/keep 模式）：system 保持原 role 与原位置、内容不动，
+// 但仍然执行空消息丢弃 / mergeConsecutiveToolAssistants / PromoteToolImages /
+// NormalizeToolOutput —— 少做任何一步都会换来上游 11148 或图片丢失。
+func EnsureUpstreamMessagesWith(messages []map[string]any, keepSystem bool) []map[string]any {
 	var (
 		instructions []string
 		rest         []map[string]any
@@ -717,6 +734,12 @@ func EnsureUpstreamMessages(messages []map[string]any) []map[string]any {
 			continue
 		}
 		if role == "system" {
+			if keepSystem {
+				if text := strings.TrimSpace(fmt.Sprint(item["content"])); text != "" && text != "<nil>" {
+					rest = append(rest, item)
+				}
+				continue
+			}
 			if text := strings.TrimSpace(fmt.Sprint(item["content"])); text != "" && text != "<nil>" {
 				instructions = append(instructions, text)
 			}
@@ -725,7 +748,7 @@ func EnsureUpstreamMessages(messages []map[string]any) []map[string]any {
 		rest = append(rest, item)
 	}
 	rest = PromoteToolImages(mergeConsecutiveToolAssistants(rest))
-	if len(instructions) == 0 {
+	if keepSystem || len(instructions) == 0 {
 		return rest
 	}
 	out := make([]map[string]any, 0, len(rest)+2)
@@ -835,7 +858,7 @@ func (c *Client) Complete(ctx context.Context, opts ChatOptions) (Result, error)
 	}
 	// CodeBuddy protocol_direct 拒绝非流式 chat（11101）。始终上游流式；
 	// 需要 JSON 的调用方仍通过 readSSE 聚合成 Turn。
-	messages := EnsureUpstreamMessages(opts.Messages)
+	messages := EnsureUpstreamMessagesWith(opts.Messages, opts.KeepSystem)
 	// global 要求首条必须是 system；显式 domestic 保持既有 payload 不变。
 	// 空 site 按 global 处理（config.NormalizeSite("") 默认归 global）。
 	if config.NormalizeSite(opts.Site) == "global" && len(messages) > 0 &&
