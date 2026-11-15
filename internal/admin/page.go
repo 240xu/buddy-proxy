@@ -2051,14 +2051,20 @@ let spMode = 'auto';
 let spHistory = {date:'', page:1, size:100, total:0, hasMore:false};
 
 function spResultLabel(e){
-  // 先判定失败：auto 降级会产生两条事件，被拦截的那次是
-  // {degraded:true, status:400, errorCode:'11128'}，属于失败，不能标成「降级成功」。
+  // 先判定失败：auto 降级会产生两条事件 —— 被拦截的那次是
+  // {degraded:true, status:400, errorCode:'11128', form:'keep'}（失败），
+  // 折叠后重放成功的是 {degraded:false, status:200, form:'fold'}。
+  // 任何失败事件都不得显示「降级成功」。
   if (e.errorCode === '11128') return '<span class="badge bad" title="已自动折叠重放">被拦截 · 11128</span>';
   if (e.status === 0) return '<span class="badge off" title="传输层失败：建连或首内容前断流">传输失败</span>';
   if (e.status >= 400) return '<span class="badge off">失败 · ' + escapeHtml(String(e.status)) + '</span>';
   if (e.errorCode) return '<span class="badge off">' + escapeHtml(e.errorCode) + '</span>';
-  // 走到这里才是成功/正常事件；degraded 仅作为补充说明。
-  if (e.degraded) return '<span class="badge warn" title="11128 被拦截后自动折叠重试成功">降级成功</span>';
+  // fold 形态的成功事件只可能来自 auto 降级后的重放，据此给出正面反馈。
+  // 不能用 e.degraded 判断：真实数据里 degraded 只打在被拦截的失败尝试上，
+  // 用它会让这个分支永远不可达。
+  if (e.form === 'fold' && e.status >= 200 && e.status < 400) {
+    return '<span class="badge warn" title="11128 被拦截后自动折叠重试成功">降级成功</span>';
+  }
   return '<span class="badge on">OK</span>';
 }
 function spRowsHtml(rows, emptyText){

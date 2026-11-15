@@ -722,7 +722,14 @@ func (s *Service) CompleteFromPool(ctx context.Context, opts CompleteOptions) (C
 				return s.CompleteFromPool(ctx, opts)
 			}
 		}
-		_ = s.Pool.MarkResult(selection, false, err.Error(), s.resolveFailureCooldown(ctx, account, err))
+		// 11128 / unapproved channel 是内容策略拒收（system 里的竞品 CLI 指纹），
+		// 不是账号问题。auto 分支已明确「不罚号」；keep 模式不降级时也一样，
+		// 否则排障模式反而会把账号打进 failureCooldown 的 5 分钟冷却，污染号池。
+		cooldown := time.Duration(0)
+		if !isChannelBlocked(err) {
+			cooldown = s.resolveFailureCooldown(ctx, account, err)
+		}
+		_ = s.Pool.MarkResult(selection, false, err.Error(), cooldown)
 		s.recordSystemPromptAttempt(opts, account, site, att, err, false)
 		return CompleteResult{}, err
 	}

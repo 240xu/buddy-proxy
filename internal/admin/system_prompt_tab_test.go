@@ -1,9 +1,167 @@
 package admin
 
 import (
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
+
+// execAdminScript 抽取页面内的一段 JS，拼上 assert 前言后交给 node -e 执行。
+// 沿用 expiry_test.go 的思路：直接跑页面里的真实函数，避免测试副本与实现分叉。
+// env 用于给 Date 相关测试固定时区。
+func execAdminScript(t *testing.T, startMarker, endMarker, prelude, body string, env ...string) {
+	t.Helper()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("可选的管理台脚本测试需要 Node.js")
+	}
+	page := PageHTML()
+	start := strings.Index(page, startMarker)
+	if start < 0 {
+		t.Fatalf("脚本缺少 %q", startMarker)
+	}
+	end := strings.Index(page[start:], endMarker)
+	if end < 0 {
+		t.Fatalf("脚本缺少结束标记 %q", endMarker)
+	}
+	script := `const assert = require('node:assert/strict');
+const escapeHtml = s => String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
+` + prelude + "\n" + page[start:start+end] + "\n" + body
+	cmd := exec.CommandContext(t.Context(), node, "-e", script)
+	if len(env) > 0 {
+		base := make([]string, 0, len(os.Environ()))
+		for _, kv := range os.Environ() {
+			key := kv
+			if i := strings.IndexByte(kv, '='); i >= 0 {
+				key = kv[:i]
+			}
+			duplicate := false
+			for _, e := range env {
+				if strings.HasPrefix(e, key+"=") {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				base = append(base, kv)
+			}
+		}
+		cmd.Env = append(base, env...)
+	}
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("管理台脚本测试失败: %v\n%s", err, output)
+	}
+}
+
+// 回归：auto 模式降级产生两条事件 ——
+//
+//	{degraded:true, status:400, errorCode:'11128', form:'keep'}  ← 被拦截的失败尝试
+//	{degraded:false, status:200, form:'fold'}                     ← 折叠后重放成功
+//
+// 失败事件绝不能标「降级成功」；「降级成功」只用于 fold 形态的成功事件。
+func TestSpResultLabelDegradedFailureIsNotSuccess(t *testing.T) {
+	execAdminScript(t, "function spResultLabel(", "\nfunction spRowsHtml(", "", `
+const fail = spResultLabel({degraded:true, status:400, errorCode:'11128', form:'keep'});
+assert.ok(!fail.includes('降级成功'), '失败事件不得显示「降级成功」，实际: ' + fail);
+assert.match(fail, /被拦截 · 11128/);
+// 折叠后重放成功（degraded=false、form=fold、200）才是「降级成功」。
+const recovered = spResultLabel({degraded:false, status:200, form:'fold'});
+assert.match(recovered, /降级成功/);
+// 普通 keep 成功仍是 OK，不能冒充降级成功。
+const ok = spResultLabel({degraded:false, status:200, form:'keep'});
+assert.match(ok, /OK/);
+assert.ok(!ok.includes('降级成功'));
+// 其它失败/异常事件也不得声称降级成功。
+for (const e of [
+  {degraded:true, status:0, errorCode:'read: connection reset'},
+  {degraded:true, status:502, errorCode:''},
+  {degraded:true, status:200, errorCode:'some_error'},
+]) {
+  assert.ok(!spResultLabel(e).includes('降级成功'), '失败事件不得显示「降级成功」: ' + JSON.stringify(e));
+}
+`)
+}
+
+// 锁死判断顺序：status / errorCode 必须排在其它判断之前，
+// 否则成功标签会抢先命中，把 400/11128 的失败事件误标成降级成功。
+func TestSpResultLabelChecksStatusBeforeDegraded(t *testing.T) {
+	page := PageHTML()
+	start := strings.Index(page, "function spResultLabel(")
+	if start < 0 {
+		t.Fatal("脚本缺少 spResultLabel")
+	}
+	end := strings.Index(page[start:], "\nfunction spRowsHtml(")
+	if end < 0 {
+		t.Fatal("脚本缺少 spRowsHtml")
+	}
+	body := page[start : start+end]
+	// 只认 return 语句里的「降级成功」标签，别被注释里的同名文字干扰。
+	returnLabel := strings.Index(body, "return '<span class=\"badge warn\"")
+	if returnLabel < 0 {
+		t.Fatal("spResultLabel 缺少「降级成功」的 return 分支")
+	}
+	for _, want := range []string{
+		"e.status >= 400",
+		"e.errorCode === '11128'",
+		"e.status === 0",
+	} {
+		i := strings.Index(body, want)
+		if i < 0 {
+			t.Fatalf("spResultLabel 缺少 %q 判断", want)
+		}
+		if i > returnLabel {
+			t.Fatalf("%q 判断必须出现在「降级成功」return 分支之前", want)
+		}
+	}
+}
+
+// 回归：首次进入 tab（openChapterHash 与 tab 按钮 click）都应加载历史，
+// 且必须在 refreshSystemPrompt() 成功后再调 refreshSpHistory()（后者依赖 spHistory.date）。
+func TestSystemPromptTabEntriesLoadHistory(t *testing.T) {
+	page := PageHTML()
+	chain := "refreshSystemPrompt().then(function(){ return refreshSpHistory(); })"
+	if n := strings.Count(page, chain); n < 3 {
+		t.Fatalf("两处 tab 入口与刷新按钮都应串联加载历史，实际串联次数 %d", n)
+	}
+	entries := []struct{ start, end string }{
+		{"function openChapterHash(", "document.querySelectorAll('.tab-link').forEach(function(btn)"},
+		{"document.querySelectorAll('.tab-link').forEach(function(btn)", "window.addEventListener('hashchange'"},
+	}
+	for _, e := range entries {
+		s := strings.Index(page, e.start)
+		if s < 0 {
+			t.Fatalf("缺少入口 %q", e.start)
+		}
+		rel := strings.Index(page[s:], e.end)
+		if rel < 0 {
+			t.Fatalf("缺少入口结束标记 %q", e.end)
+		}
+		if !strings.Contains(page[s:s+rel], chain) {
+			t.Fatalf("入口 %q 未在 refreshSystemPrompt 后串联 refreshSpHistory", e.start)
+		}
+	}
+}
+
+// 回归：无事件文件时日期兜底必须用本地日期（后端 eventDate 用 time.Local），
+// 不能用 toISOString()（UTC）——本地 00:00–08:00 会算出「昨天」。
+func TestFillSpDatesUsesLocalDate(t *testing.T) {
+	body := `
+const RealDate = Date;
+class FakeDate extends RealDate {
+  constructor(...args){ if (!args.length) super(2026,0,1,3,0,0); else super(...args); }
+  static now(){ return new RealDate(2026,0,1,3,0,0).getTime(); }
+}
+const spDateNode = {innerHTML:'', value:''};
+const $ = (id) => spDateNode;
+let spHistory = {date:''};
+global.Date = FakeDate;
+fillSpDates([]);
+assert.match(spDateNode.innerHTML, /value="20260101"/, '空列表兜底应为本地日期 20260101，实际: ' + spDateNode.innerHTML);
+assert.ok(!spDateNode.innerHTML.includes('20251231'), '不得使用 UTC 日期（昨天），实际: ' + spDateNode.innerHTML);
+`
+	execAdminScript(t, "function fillSpDates(", "\nasync function refreshSystemPrompt(", "", body, "TZ=Asia/Shanghai")
+}
 
 func TestSystemPromptTabRendered(t *testing.T) {
 	page := PageHTML()
@@ -37,7 +195,6 @@ func TestUsageTabIndexShiftedTo07(t *testing.T) {
 
 func TestSystemPromptTabIsTopLevel(t *testing.T) {
 	page := PageHTML()
-	// 必须是独立一级 tab，而不是塞进 05 模型与路由里。
 	models := strings.Index(page, `id="tab-models"`)
 	sp := strings.Index(page, `id="tab-system-prompt"`)
 	usage := strings.Index(page, `id="tab-usage"`)
@@ -71,7 +228,6 @@ func TestUsageTableHasSystemColumn(t *testing.T) {
 	if !strings.Contains(page, "<th>System</th>") {
 		t.Fatal("用量明细表应新增 System 列")
 	}
-	// 新增一列后 colspan 必须从 11 跟上，否则空态会错位。
 	if strings.Contains(page, `colspan="11"`) {
 		t.Fatal("用量表 colspan 仍为 11，加列后应为 12")
 	}
@@ -82,7 +238,6 @@ func TestUsageTableHasSystemColumn(t *testing.T) {
 
 func TestSystemPromptModeDescriptionsAreConcrete(t *testing.T) {
 	page := PageHTML()
-	// 「原样」既不是整个 body 原样，也不是使用端原样，指代不明 —— 不得再出现。
 	if strings.Contains(page, "原样") {
 		t.Fatal("模式说明不得再使用含糊的「原样」")
 	}
@@ -98,7 +253,6 @@ func TestSystemPromptModeDescriptionsAreConcrete(t *testing.T) {
 			t.Fatalf("模式说明缺少 %q", want)
 		}
 	}
-	// 技术名仍必须保留（API / 日志 / .env 用它）。
 	for _, want := range []string{`data-mode="auto"`, `data-mode="keep"`, `data-mode="fold"`} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("缺少技术名 %q", want)
