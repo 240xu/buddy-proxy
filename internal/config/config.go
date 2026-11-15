@@ -26,7 +26,12 @@ const (
 	DefaultOAuthSessionTTL     = 15 * time.Minute
 	DefaultHTTPTimeout         = 120 * time.Second
 	DefaultServerIdleTimeout   = 120 * time.Second
-	DefaultMaxBodyMB           = 64
+	// StallTimeout 是上游流「连续无字节」看门狗：首字节前用它，命中后切到
+	// StallTimeoutAfterFirstByte。两者都远大于正常思考间隔，避免长静默被误杀。
+	// 默认值从 3 分钟提到 10 分钟（用户实测有 5~6 分钟的长思考回合）。
+	DefaultStallTimeout               = 10 * time.Minute
+	DefaultStallTimeoutAfterFirstByte = 10 * time.Minute
+	DefaultMaxBodyMB                  = 64
 	// 签到失败重试：10 分钟后重试一次。签到失败多是上游瞬时抖动，
 	// 试太多次意义有限；间隔太短则可能撞上同一波故障。
 	DefaultCheckinRetryInterval = 10 * time.Minute
@@ -75,15 +80,20 @@ type Config struct {
 	// 为空则沿用默认客户端（国内站路径不变）。
 	// 存在的理由：www.codebuddy.ai 从中国大陆直连会被 TLS 握手超时拦掉，
 	// 而 OAuth 的 auth/state 与 auth/token 两个调用都走这个客户端。
-	OAuthProxy          string
-	HTTPTimeout         time.Duration
-	ServerIdleTimeout   time.Duration
-	ShutdownGrace       time.Duration
-	MaxBodyMB           int
-	MaxIdleConns        int
-	MaxIdleConnsPerHost int
-	IdleConnTimeout     time.Duration
-	DefaultModels       []string
+	OAuthProxy  string
+	HTTPTimeout time.Duration
+	// StallTimeout 首字节前的「连续无字节」阈值；0 表示关闭看门狗（仅测试用）。
+	StallTimeout time.Duration
+	// StallTimeoutAfterFirstByte 收到任意 SSE 增量后的阈值（含 thinking/心跳）。
+	// 真正的「上游假活」几乎都发生在首字节之前，之后放宽以免掐断长思考。
+	StallTimeoutAfterFirstByte time.Duration
+	ServerIdleTimeout          time.Duration
+	ShutdownGrace              time.Duration
+	MaxBodyMB                  int
+	MaxIdleConns               int
+	MaxIdleConnsPerHost        int
+	IdleConnTimeout            time.Duration
+	DefaultModels              []string
 
 	// Watch 是进程内波动监测配置（见 internal/watch）。
 	Watch watch.Config
@@ -127,6 +137,8 @@ func Load() Config {
 		OAuthSessionTTL:            DefaultOAuthSessionTTL,
 		OAuthProxy:                 strings.TrimSpace(firstEnv("CODEBUDDY_PROXY_OAUTH_PROXY")),
 		HTTPTimeout:                DefaultHTTPTimeout,
+		StallTimeout:               envDurationPositive("CODEBUDDY_PROXY_STALL_TIMEOUT_MS", DefaultStallTimeout),
+		StallTimeoutAfterFirstByte: envDurationPositive("CODEBUDDY_PROXY_STALL_AFTER_FIRST_BYTE_MS", DefaultStallTimeoutAfterFirstByte),
 		ServerIdleTimeout:          envDuration("CODEBUDDY_PROXY_SERVER_IDLE_TIMEOUT_MS", "", DefaultServerIdleTimeout),
 		ShutdownGrace:              envDuration("CODEBUDDY_PROXY_SHUTDOWN_GRACE_MS", "", DefaultShutdownGrace),
 		MaxBodyMB:                  envInt("CODEBUDDY_PROXY_MAX_BODY_MB", "", DefaultMaxBodyMB),
@@ -277,6 +289,20 @@ func envDuration(primary, fallback string, def time.Duration) time.Duration {
 	}
 	n, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
+		return def
+	}
+	return time.Duration(n) * time.Millisecond
+}
+
+// envDurationPositive 读毫秒配置，只在严格为正时采用；空 / 非法 / 非正都回落默认。
+// 用于看门狗阈值：0 会关闭看门狗，绝不能由误配置悄悄产生。
+func envDurationPositive(primary string, def time.Duration) time.Duration {
+	raw := firstEnv(primary)
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n <= 0 {
 		return def
 	}
 	return time.Duration(n) * time.Millisecond

@@ -27,9 +27,13 @@ type Client struct {
 	IDEVersion string
 	// Log 上游失败排障日志；为空时回退 slog.Default()。网关 New 时注入进程 logger。
 	Log *slog.Logger
-	// StallTimeout 上游流停滞看门狗：连续这么久收不到字节就主动断开。
-	// 零值关闭（&Client{} 测试保持旧行为），生产由 NewClient 赋值。
+	// StallTimeout 上游流停滞看门狗（首字节前）：连续这么久收不到字节就主动断开。
+	// 零值关闭（&Client{} 测试保持旧行为），生产由 NewClient 从 config 赋值。
 	StallTimeout time.Duration
+	// StallTimeoutAfterFirstByte 是收到任意 SSE 增量（含 thinking / 心跳）后的阈值。
+	// 真正的「上游假活」几乎都发生在首字节之前；之后放宽，避免掐断长思考回合。
+	// 零值时沿用 StallTimeout。
+	StallTimeoutAfterFirstByte time.Duration
 
 	// base 是直连用的 Transport，各出口按需 Clone（连接池互不干扰）。
 	base    *http.Transport
@@ -110,10 +114,11 @@ func NewClient(cfg config.Config) *Client {
 			Timeout:   0,
 			Transport: transport,
 		},
-		base:         transport,
-		IDEVersion:   strutil.First(cfg.IDEVersion, config.DefaultIDEVersion),
-		Log:          slog.Default(),
-		StallTimeout: defaultStallTimeout,
+		base:                       transport,
+		IDEVersion:                 strutil.First(cfg.IDEVersion, config.DefaultIDEVersion),
+		Log:                        slog.Default(),
+		StallTimeout:               cfg.StallTimeout,
+		StallTimeoutAfterFirstByte: cfg.StallTimeoutAfterFirstByte,
 	}
 }
 
@@ -1152,7 +1157,7 @@ func (c *Client) readSSE(body io.Reader, opts ChatOptions) (Result, error) {
 	acc := newAccumulator()
 	fixer := newATXFixer()
 	var guard *stallGuard
-	if g := newStallGuard(body, c.StallTimeout); g != nil {
+	if g := newStallGuard(body, c.StallTimeout, c.StallTimeoutAfterFirstByte); g != nil {
 		guard = g
 		defer g.timer.Stop()
 		body = g
@@ -1248,6 +1253,11 @@ func (c *Client) readSSE(body io.Reader, opts ChatOptions) (Result, error) {
 	for {
 		line, err := reader.ReadString('\n')
 		bytesRead += int64(len(line))
+		if len(line) > 0 && guard != nil {
+			// 任意字节都算「上游活着」，含 thinking 增量、心跳注释、空行。
+			// 首字节之后切到宽松阈值，长思考静默不再被 3 分钟看门狗误杀。
+			guard.noteFirstByte()
+		}
 		if len(line) > 0 {
 			trimmed := strings.TrimRight(line, "\r\n")
 			if trimmed == "" {
@@ -2066,31 +2076,42 @@ func truthy(value any) bool {
 	}
 }
 
-// defaultStallTimeout 是上游流停滞看门狗的固定值：大于正常思考间隔，远小于
-// TCP 超时。与 quotaRefreshTimeout / maxResetReplays 一样是内部常量，不新增 env。
-const defaultStallTimeout = 3 * time.Minute
-
 // stallGuard 包装上游响应体：每次读到字节就把定时器往后推，超时则关闭 body，
 // 让阻塞中的 Read 立刻返回错误，把「上游假活」从无限挂起收敛成可判定的失败。
 type stallGuard struct {
 	r       io.Reader
 	closer  io.Closer
 	timeout time.Duration
-	timer   *time.Timer
-	fired   atomic.Bool
+	// afterFirstByte 是收到首字节后切换到的宽松阈值；<=0 表示沿用 timeout。
+	afterFirstByte time.Duration
+	timer          *time.Timer
+	fired          atomic.Bool
+	widened        atomic.Bool
 }
 
-func newStallGuard(body io.Reader, timeout time.Duration) *stallGuard {
+// newStallGuard 用「连续无字节」判定上游假活：每次读到字节都把定时器往后推，
+// 不是总时长上限。timeout 用于首字节前；afterFirstByte 用于首字节后（0=沿用）。
+func newStallGuard(body io.Reader, timeout, afterFirstByte time.Duration) *stallGuard {
 	closer, ok := body.(io.Closer)
 	if timeout <= 0 || !ok {
 		return nil
 	}
-	g := &stallGuard{r: body, closer: closer, timeout: timeout}
+	g := &stallGuard{r: body, closer: closer, timeout: timeout, afterFirstByte: afterFirstByte}
 	g.timer = time.AfterFunc(timeout, func() {
 		g.fired.Store(true)
 		_ = g.closer.Close()
 	})
 	return g
+}
+
+// noteFirstByte 在 readSSE 收到任意字节（含 thinking / 心跳 / 注释帧）后调用，
+// 把阈值放宽到 afterFirstByte 并重启定时器。只生效一次。
+func (g *stallGuard) noteFirstByte() {
+	if g == nil || g.afterFirstByte <= 0 || !g.widened.CompareAndSwap(false, true) {
+		return
+	}
+	g.timeout = g.afterFirstByte
+	g.timer.Reset(g.timeout)
 }
 
 func (g *stallGuard) Read(p []byte) (int, error) {
