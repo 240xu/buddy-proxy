@@ -59,14 +59,15 @@ const escapeHtml = s => String(s).replaceAll('&','&amp;').replaceAll('<','&lt;')
 //	{degraded:true, status:400, errorCode:'11128', form:'keep'}  ← 被拦截的失败尝试
 //	{degraded:false, status:200, form:'fold'}                     ← 折叠后重放成功
 //
-// 失败事件绝不能标「降级成功」；「降级成功」只用于 fold 形态的成功事件。
+// 失败事件绝不能标「降级成功」；「降级成功」只由 recovered:true + mode:'auto' 判定，
+// fold 模式下的普通 fold/200 正常请求必须显示 OK。
 func TestSpResultLabelDegradedFailureIsNotSuccess(t *testing.T) {
 	execAdminScript(t, "function spResultLabel(", "\nfunction spRowsHtml(", "", `
 const fail = spResultLabel({degraded:true, status:400, errorCode:'11128', form:'keep'});
 assert.ok(!fail.includes('降级成功'), '失败事件不得显示「降级成功」，实际: ' + fail);
 assert.match(fail, /被拦截 · 11128/);
-// 折叠后重放成功（degraded=false、form=fold、200）才是「降级成功」。
-const recovered = spResultLabel({degraded:false, status:200, form:'fold'});
+// 折叠后重放成功（recovered:true、mode:auto、200）才标「降级成功」。
+const recovered = spResultLabel({degraded:false, status:200, form:'fold', recovered:true, mode:'auto'});
 assert.match(recovered, /降级成功/);
 // 普通 keep 成功仍是 OK，不能冒充降级成功。
 const ok = spResultLabel({degraded:false, status:200, form:'keep'});
