@@ -63,10 +63,16 @@ func isChannelBlocked(err error) bool {
 var (
 	upstreamStatusPattern = regexp.MustCompile(`(?i)failed with (\d{3})`)
 	upstreamCodePattern   = regexp.MustCompile(`\(code (\d+)\)`)
+	// 上游有时只回裸码（没有 "(code N)" 包裹），且新码会不断出现。
+	// 用通用 5 位 1xxxx 正则，别再维护一份会漏的手工白名单：
+	// 线上出现过 11134，旧白名单漏它 → ErrorCode 为空 → 被误标成 Status=0（传输失败）。
+	//
+	// 约束要严，别把网络地址/端口里的数字当错误码：
+	//  - 前面不能是 ':'（127.0.0.1:14080 里的 14080 是 WARP 本地端口）、
+	//    也不能是 '.'（IP 片段）、数字或字母（避免拼在更长串里）；
+	//  - 用 \b 边界挡住 3 位 HTTP 状态、6 位数字、长度/耗时、十六进制 ID。
+	upstreamBareCodePattern = regexp.MustCompile(`(^|[^:\.\w])(1\d{4})\b`)
 )
-
-// knownUpstreamCodes 覆盖错误文本里没有 (code N) 包裹时也要认出来的码。
-var knownUpstreamCodes = []string{"11128", "11148", "11129", "11115", "11101", "11102", "11140", "14401"}
 
 // systemPromptErrorStatus 把上游错误压成面板可读的 (status, code)。
 // 上游有响应但拒绝 → 该 HTTP 状态；根本没拿到响应（建连 / 首内容前断流）→ 0。
@@ -87,13 +93,13 @@ func systemPromptErrorStatus(err error) (int, string) {
 }
 
 func upstreamErrorCode(msg string) string {
+	// 带 "(code N)" 的优先：这是上游最明确的口径。
 	if m := upstreamCodePattern.FindStringSubmatch(msg); m != nil {
 		return m[1]
 	}
-	for _, code := range knownUpstreamCodes {
-		if strings.Contains(msg, code) {
-			return code
-		}
+	// 否则取文本里第一个 1xxxx 裸码（捕获组 2，组 1 是前导分隔符）。
+	if m := upstreamBareCodePattern.FindStringSubmatch(msg); m != nil {
+		return m[2]
 	}
 	return ""
 }
