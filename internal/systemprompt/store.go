@@ -184,6 +184,48 @@ func (s *Store) Read(date string, offset, limit int) ([]Event, int, error) {
 	return out, total, nil
 }
 
+// StatsForDate 从某一天的 jsonl 全量统计（不受进程重启影响）。
+// date 为 20060102；文件不存在返回零值 Stats。
+// 复用 statsFrom 与 Journal.Stats24h 完全相同的统计逻辑（cutoff=0 表示全量），
+// 保证实时视图与按天历史视图口径一致。
+func (s *Store) StatsForDate(date string) (Stats, error) {
+	if s == nil {
+		return Stats{}, nil
+	}
+	date = strings.TrimSpace(date)
+	if _, err := time.ParseInLocation(storeDateLayout, date, time.Local); err != nil {
+		return Stats{}, fmt.Errorf("systemprompt: 非法日期 %q", date)
+	}
+
+	// 与 Read 一致：锁内只取磁盘路径或内存切片快照，文件 I/O 与反序列化在锁外。
+	s.mu.Lock()
+	memoryOnly := s.dir == ""
+	var memSnapshot []Event
+	path := ""
+	if memoryOnly {
+		memSnapshot = append([]Event(nil), s.mem...)
+	} else {
+		path = s.pathFor(date)
+	}
+	s.mu.Unlock()
+
+	var all []Event
+	if memoryOnly {
+		for _, e := range memSnapshot {
+			if eventDate(e) == date {
+				all = append(all, e)
+			}
+		}
+	} else {
+		events, err := readFileEvents(path)
+		if err != nil {
+			return Stats{}, err
+		}
+		all = events
+	}
+	return statsFrom(all, 0), nil
+}
+
 func readFileEvents(path string) ([]Event, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
