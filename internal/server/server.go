@@ -1856,11 +1856,13 @@ func (s *Server) handleSystemPromptEvents(w http.ResponseWriter, r *http.Request
 	}
 	total := len(all)
 	start := (page - 1) * size
-	if start > total {
+	// page 无上界时 (page-1)*size 可能溢出成负数（如 page=1e17），
+	// 负下标切片会 panic，让 net/http 断连并打堆栈。正向越界与溢出都钳到末尾（返回空页）。
+	if start < 0 || start > total {
 		start = total
 	}
 	end := start + size
-	if end > total {
+	if end < 0 || end > total {
 		end = total
 	}
 	httputil.WriteJSON(w, http.StatusOK, map[string]any{

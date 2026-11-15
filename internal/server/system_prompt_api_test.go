@@ -140,6 +140,35 @@ func TestSystemPromptEventsPaging(t *testing.T) {
 	}
 }
 
+func TestSystemPromptEventsHugePageDoesNotPanic(t *testing.T) {
+	srv := systemPromptTestServer(t)
+	for i := 0; i < 3; i++ {
+		srv.Svc.RecordSystemPromptEvent(systemprompt.Event{
+			At: time.Now().UnixMilli(), Form: "keep", Status: 200,
+		})
+	}
+	date := time.Now().Format("20060102")
+	// (page-1)*size 会溢出成负数；旧代码以负下标切片 all[start:end] 直接 panic。
+	rec := doAdminRequest(t, srv, http.MethodGet,
+		"/direct-admin/api/system-prompt/events?date="+date+"&page=100000000000000000&size=100", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 %d: %s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Events []systemprompt.Event `json:"events"`
+		Total  int                  `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Events) != 0 {
+		t.Fatalf("越界页 events 应为空，实际 %d 条", len(payload.Events))
+	}
+	if payload.Total != 3 {
+		t.Fatalf("total 应仍为 3，实际 %d", payload.Total)
+	}
+}
+
 func TestSystemPromptEventsOnlyProblems(t *testing.T) {
 	srv := systemPromptTestServer(t)
 	now := time.Now().UnixMilli()

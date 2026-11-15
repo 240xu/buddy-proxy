@@ -137,20 +137,32 @@ func (s *Store) Read(date string, offset, limit int) ([]Event, int, error) {
 		return nil, 0, fmt.Errorf("systemprompt: 非法日期 %q", date)
 	}
 
+	// 锁内只取「磁盘路径」或「内存切片快照」，文件 I/O 与逐行反序列化一律放锁外。
+	// Append 在每条请求结束时都要拿同一把锁；若把整日全量读+解析压在锁内，
+	// 管理员面板每 5 秒一轮的历史拉取会阻塞写事件，日文件越大越明显。
+	// 磁盘并发安全性：Append 用 O_APPEND 单次 Write 整行，文件系统保证不交错；
+	// 锁外读一个正在追加的文件最坏是最后一截半行，readFileEvents 会跳过坏行。
+	// Prune 可能在读期间删文件 → os.ReadFile 返回 ErrNotExist，按「空」处理即可。
 	s.mu.Lock()
-	// 内存 store 无文件，直接读 mem 切片；磁盘 store 在锁外读文件更宽松，
-	// 但保持简单：锁内读，保证与 Append 的可见性一致。
-	defer s.mu.Unlock()
+	memoryOnly := s.dir == ""
+	var memSnapshot []Event
+	path := ""
+	if memoryOnly {
+		memSnapshot = append([]Event(nil), s.mem...)
+	} else {
+		path = s.pathFor(date)
+	}
+	s.mu.Unlock()
 
 	var all []Event
-	if s.dir == "" {
-		for _, e := range s.mem {
+	if memoryOnly {
+		for _, e := range memSnapshot {
 			if eventDate(e) == date {
 				all = append(all, e)
 			}
 		}
 	} else {
-		events, err := s.readFileEventsLocked(date)
+		events, err := readFileEvents(path)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -172,8 +184,8 @@ func (s *Store) Read(date string, offset, limit int) ([]Event, int, error) {
 	return out, total, nil
 }
 
-func (s *Store) readFileEventsLocked(date string) ([]Event, error) {
-	raw, err := os.ReadFile(s.pathFor(date))
+func readFileEvents(path string) ([]Event, error) {
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil

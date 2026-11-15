@@ -112,6 +112,67 @@ func TestStoreConcurrentAppendNoInterleaving(t *testing.T) {
 	}
 }
 
+func TestStoreConcurrentAppendAndRead(t *testing.T) {
+	// Read 把文件 I/O 与反序列化移出 s.mu 后，必须仍能和持续 Append 安全并发：
+	// -race 下无 DATA RACE，不 panic，且不会读到半行 JSON（坏行会被跳过）。
+	dir := t.TempDir()
+	s, err := OpenStore(dir, 7*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	at := time.Date(2026, 11, 15, 10, 0, 0, 0, time.Local).UnixMilli()
+	const appends = 200
+	const reads = 200
+
+	var wg sync.WaitGroup
+	// 写协程：每条都是一次完整的 O_APPEND 整行写。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < appends; i++ {
+			if err := s.Append(Event{At: at, Form: "keep", Status: 200, Model: fmt.Sprintf("m-%d", i)}); err != nil {
+				t.Errorf("Append 失败: %v", err)
+				return
+			}
+		}
+	}()
+	// 读协程：一边写一边反复全量读。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < reads; i++ {
+			events, total, err := s.Read("20261115", 0, 0)
+			if err != nil {
+				t.Errorf("Read 失败: %v", err)
+				return
+			}
+			if total < len(events) || len(events) > appends {
+				t.Errorf("读取结果异常: total=%d len=%d", total, len(events))
+				return
+			}
+			for _, e := range events {
+				// 能反序列化出来的必然是完整行；关键字段不该被并发写坏。
+				if e.At != at {
+					t.Errorf("读到损坏事件: %+v", e)
+					return
+				}
+			}
+		}
+	}()
+	wg.Wait()
+
+	// 全部写完后，最终全量读必须能看到全部整行。
+	_, total, err := s.Read("20261115", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != appends {
+		t.Fatalf("最终应有 %d 条，实际 %d", appends, total)
+	}
+}
+
 func TestStoreSkipsBadLines(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := OpenStore(dir, 7*24*time.Hour)
