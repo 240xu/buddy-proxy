@@ -104,13 +104,60 @@ func TestRecordSystemPromptEventNeverStoresPlaintext(t *testing.T) {
 	}
 }
 
-// blockOnceTransport 第一次 chat 调用返回 11128，之后返回正常 SSE。
-// neverBlock=true 时永远返回正常 SSE（用于验证不重试的路径）。
+// claudeCodeMarker 是上游 11128（竞品 CLI 指纹）扫描命中的精确整句。
+const claudeCodeMarker = "You are Claude Code, Anthropic's official CLI for Claude."
+
+// blockOnceTransport 按**请求体内容**决定是否拦截：只要存在 role==system 且
+// content 含 claudeCodeMarker 的消息就回 11128，否则回正常 SSE。
+// 折叠后该句被挪进 user 的 <client_instructions>、system 换成 canonical，
+// 于是不再命中扫描 —— 降级用例由此真正锁住「折叠是让它通过的原因」，
+// 而不只是「发生了一次重试」。neverBlock=true 时永不拦截。
+// onChat 在每次 chat 请求时触发，用于构造「请求进行中切换模式」的场景。
 type blockOnceTransport struct {
 	mu         sync.Mutex
-	chats      int
 	bodies     []string
 	neverBlock bool
+	onChat     func()
+}
+
+// messageContentText 把消息 content 压成可检索文本（字符串或 text 块数组）。
+func messageContentText(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var b strings.Builder
+		for _, part := range v {
+			switch p := part.(type) {
+			case string:
+				b.WriteString(p)
+			case map[string]any:
+				if text, ok := p["text"].(string); ok {
+					b.WriteString(text)
+				}
+			}
+		}
+		return b.String()
+	default:
+		return ""
+	}
+}
+
+// carriesClaudeSystem 判定请求体里是否有带竞品 CLI 指纹整句的 system 消息。
+func carriesClaudeSystem(body []byte) bool {
+	var payload struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	for _, m := range payload.Messages {
+		role, _ := m["role"].(string)
+		if role == "system" && strings.Contains(messageContentText(m["content"]), claudeCodeMarker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *blockOnceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -135,12 +182,14 @@ func (t *blockOnceTransport) RoundTrip(req *http.Request) (*http.Response, error
 		raw, _ = io.ReadAll(req.Body)
 	}
 	t.mu.Lock()
-	t.chats++
-	n := t.chats
 	neverBlock := t.neverBlock
+	onChat := t.onChat
 	t.bodies = append(t.bodies, string(raw))
 	t.mu.Unlock()
-	if n == 1 && !neverBlock {
+	if onChat != nil {
+		onChat()
+	}
+	if !neverBlock && carriesClaudeSystem(raw) {
 		header.Set("Content-Type", "application/json")
 		return &http.Response{
 			StatusCode: http.StatusBadRequest, Status: "Bad Request", Header: header,
@@ -180,7 +229,7 @@ func TestAutoModeDowngradesOn11128(t *testing.T) {
 	transport := &blockOnceTransport{}
 	svc.Provider.HTTP = &http.Client{Transport: transport}
 
-	const clientSystem = "You are Claude Code, Anthropic's official CLI for Claude."
+	const clientSystem = claudeCodeMarker
 	outcome := &SystemPromptOutcome{}
 	_, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
 		Model: "auto",
@@ -198,8 +247,13 @@ func TestAutoModeDowngradesOn11128(t *testing.T) {
 	if len(bodies) != 2 {
 		t.Fatalf("应打 2 次上游（keep 失败 + fold 重试），实际 %d", len(bodies))
 	}
-	if !strings.Contains(bodies[0], "You are Claude Code") {
-		t.Fatalf("第一次应原样带 system，实际 body=%s", bodies[0])
+	// 真正锁住因果：第一次原样带竞品 CLI 指纹 system（正是 mock 拦它的原因），
+	// 折叠后不再有带该句的 system 消息（mock 据此放行），重试才成功。
+	if !carriesClaudeSystem([]byte(bodies[0])) {
+		t.Fatalf("第一次应原样带含指纹整句的 system，实际 body=%s", bodies[0])
+	}
+	if carriesClaudeSystem([]byte(bodies[1])) {
+		t.Fatalf("折叠后不应再有带指纹整句的 system，实际 body=%s", bodies[1])
 	}
 	folded := chatBodyMessages(t, bodies[1])
 	if len(folded) == 0 || folded[0]["role"] != "system" {
@@ -305,6 +359,124 @@ func TestFoldModeNeverSendsClientSystem(t *testing.T) {
 	}
 	if !strings.Contains(bodies[0], "client_instructions") {
 		t.Fatalf("fold 模式应折叠到 <client_instructions>：%s", bodies[0])
+	}
+}
+
+// newModeSnapshotTestService 构造一个带单账号、可控 HTTP transport 的服务，
+// 用于「请求中途切换模式」的快照归因测试。
+func newModeSnapshotTestService(t *testing.T, mode string, transport http.RoundTripper) *Service {
+	t.Helper()
+	dir := t.TempDir()
+	svc := New(config.Config{
+		Site:             "domestic",
+		AccountsPath:     filepath.Join(dir, "accounts.json"),
+		UsagePath:        filepath.Join(dir, "proxy-usage.json"),
+		SystemPromptMode: mode,
+	}, nil)
+	t.Cleanup(func() { _ = svc.Close() })
+	if _, _, err := svc.Pool.Upsert(accounts.CreateAccount(accounts.Account{
+		Label: "a", Site: "domestic", BearerToken: "token-a", Enabled: true,
+		AuthStatus: accounts.AuthStatus{UserID: "u-a"},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	svc.Provider.HTTP = &http.Client{Transport: transport}
+	return svc
+}
+
+// TestSystemPromptEventModeIsSnapshot 锁住「Event.Mode 是请求入口的模式」：
+// 请求进行中管理员把模式切成 fold，事件仍应记请求开始时的 auto。
+func TestSystemPromptEventModeIsSnapshot(t *testing.T) {
+	transport := &blockOnceTransport{neverBlock: true}
+	svc := newModeSnapshotTestService(t, config.SystemPromptModeAuto, transport)
+	// 第一次（也是唯一一次）chat 请求发出时把模式切成 fold。
+	transport.onChat = func() {
+		svc.SetBehaviorSwitches(BehaviorSwitches{SystemPromptMode: config.SystemPromptModeFold})
+	}
+
+	_, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
+		Model: "auto",
+		Messages: []map[string]any{
+			{"role": "system", "content": claudeCodeMarker},
+			{"role": "user", "content": "hi"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("请求应成功，实际 %v", err)
+	}
+	if got := svc.Config().SystemPromptMode; got != config.SystemPromptModeFold {
+		t.Fatalf("前置校验：请求结束后实时模式应为 fold，实际 %q", got)
+	}
+	events := svc.SystemPromptJournal.Recent(10)
+	if len(events) != 1 {
+		t.Fatalf("应记 1 条事件，实际 %d：%+v", len(events), events)
+	}
+	if events[0].Mode != config.SystemPromptModeAuto {
+		t.Fatalf("Event.Mode 应为请求开始时的 auto，实际 %q（实时值已变 fold）", events[0].Mode)
+	}
+}
+
+// TestSystemPromptDowngradeEventsShareSnapshotMode 锁住降级链两条事件的模式一致：
+// 中途切成 fold 后，keep/11128 与 fold/200 两条事件都必须是请求入口的 auto，
+// 不能一条 auto 一条 fold。
+func TestSystemPromptDowngradeEventsShareSnapshotMode(t *testing.T) {
+	transport := &blockOnceTransport{}
+	svc := newModeSnapshotTestService(t, config.SystemPromptModeAuto, transport)
+	transport.onChat = func() {
+		svc.SetBehaviorSwitches(BehaviorSwitches{SystemPromptMode: config.SystemPromptModeFold})
+	}
+
+	_, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
+		Model: "auto",
+		Messages: []map[string]any{
+			{"role": "system", "content": claudeCodeMarker},
+			{"role": "user", "content": "hi"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("降级后应成功，实际 %v", err)
+	}
+	events := svc.SystemPromptJournal.Recent(10)
+	if len(events) != 2 {
+		t.Fatalf("应记 2 条事件，实际 %d：%+v", len(events), events)
+	}
+	for i, e := range events {
+		if e.Mode != config.SystemPromptModeAuto {
+			t.Fatalf("第 %d 条事件 Mode 应为入口快照 auto，实际 %q：%+v", i, e.Mode, e)
+		}
+	}
+}
+
+// TestSystemPromptDowngradeUsesSnapshotMode 锁住降级判定也用入口快照：
+// 请求以 keep 开始，中途才切成 auto；不应因实时值变成 auto 而触发降级。
+func TestSystemPromptDowngradeUsesSnapshotMode(t *testing.T) {
+	transport := &blockOnceTransport{}
+	svc := newModeSnapshotTestService(t, config.SystemPromptModeKeep, transport)
+	transport.onChat = func() {
+		svc.SetBehaviorSwitches(BehaviorSwitches{SystemPromptMode: config.SystemPromptModeAuto})
+	}
+
+	outcome := &SystemPromptOutcome{}
+	_, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
+		Model: "auto",
+		Messages: []map[string]any{
+			{"role": "system", "content": claudeCodeMarker},
+			{"role": "user", "content": "hi"},
+		},
+		SystemOutcome: outcome,
+	})
+	if err == nil {
+		t.Fatal("keep 入口不应降级，11128 应原样返回")
+	}
+	if got := len(transport.snapshotBodies()); got != 1 {
+		t.Fatalf("入口快照为 keep ⇒ 不得降级重试，实际打了 %d 次", got)
+	}
+	if outcome.Degraded {
+		t.Fatalf("outcome 不应标记 degraded，实际 %+v", outcome)
+	}
+	events := svc.SystemPromptJournal.Recent(10)
+	if len(events) != 1 || events[0].Mode != config.SystemPromptModeKeep {
+		t.Fatalf("事件应为单条 keep 模式，实际 %+v", events)
 	}
 }
 

@@ -376,6 +376,9 @@ type CompleteOptions struct {
 
 	// RequestID 是本次请求的代理 ID，用来把 system 事件与用量明细对上。
 	RequestID string
+	// systemMode 是请求首次进入 CompleteFromPool 时快照的 system 模式，
+	// 沿递归重试原样传递（opts 按值传递），调用方不要设置。
+	systemMode string
 	// FoldedRetry 表示已经因 11128 降级过一次；置位后强制 fold，防止无限重试。
 	FoldedRetry bool
 	// SystemOutcome 非空时由 CompleteFromPool 回填实际 system 形态（keep / fold / degraded）。
@@ -446,8 +449,7 @@ func (s *Service) chatOptionsFromAccount(account accounts.Account, opts Complete
 		OnEvent:            opts.OnEvent,
 		DeliverToolDeltas:  opts.DeliverToolDeltas,
 		// system 策略：fold 永远折叠；auto/keep 原样透传；已降级过的重试强制折叠。
-		KeepSystem:  s.keepSystemFor(opts),
-		FoldedRetry: opts.FoldedRetry,
+		KeepSystem: s.keepSystemFor(opts),
 	}
 }
 
@@ -489,6 +491,11 @@ func SessionPinKey(session, site string) string {
 
 func (s *Service) CompleteFromPool(ctx context.Context, opts CompleteOptions) (CompleteResult, error) {
 	opts.Model = strutil.First(opts.Model, "auto")
+	// 模式只在首次进入时快照一次，沿所有递归重试沿用：管理员在请求进行中
+	// 切换模式不改变本次请求实际发出的形态，事件归因与降级判定都以它为准。
+	if opts.systemMode == "" {
+		opts.systemMode = s.systemPromptMode()
+	}
 	// 模型路由：用户在管理台配置「源站点 + 源模型名 → 目标站点 + 目标模型名」。
 	//
 	// 只在逻辑请求入口匹配一次；递归重试继续使用已选定的目标。
@@ -585,7 +592,7 @@ func (s *Service) CompleteFromPool(ctx context.Context, opts CompleteOptions) (C
 		s.Log.Debug("pool select bypassed cooldown (all accounts cooling)", "accountId", account.ID, "cooldownUntil", account.CooldownUntil)
 	}
 	// system 侧快照：只算一次指纹（超长 system 也不重复哈希），并回填给调用方。
-	att := systemAttempt{started: time.Now(), keepForm: s.keepSystemFor(opts)}
+	att := systemAttempt{started: time.Now(), keepForm: s.keepSystemFor(opts), mode: opts.systemMode}
 	att.fp, att.size = systemPromptDigest(opts.Messages)
 	if opts.SystemOutcome != nil {
 		opts.SystemOutcome.Form = formName(att.keepForm)
@@ -621,7 +628,7 @@ func (s *Service) CompleteFromPool(ctx context.Context, opts CompleteOptions) (C
 		// CLI 指纹扫描；每个请求最多降级一次（FoldedRetry 防死循环）。
 		// 这是内容策略拒收，不是账号问题：不罚号、不换号。
 		// keep 模式不降级 —— 用户显式要求「永远原样」，被拦截就如实报错。
-		if att.keepForm && s.systemPromptMode() == config.SystemPromptModeAuto &&
+		if att.keepForm && att.mode == config.SystemPromptModeAuto &&
 			!opts.FoldedRetry && isChannelBlocked(err) {
 			s.recordSystemPromptAttempt(opts, account, site, att, err, true)
 			if opts.SystemOutcome != nil {

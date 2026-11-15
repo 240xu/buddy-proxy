@@ -155,8 +155,6 @@ type ChatOptions struct {
 	Proxy string
 	// KeepSystem 为 true 时原样透传客户端 system（auto / keep 模式）。
 	KeepSystem bool
-	// FoldedRetry 表示本请求已经因 11128 降级过一次，防止无限重试。
-	FoldedRetry bool
 }
 
 type Event struct {

@@ -34,11 +34,14 @@ type SystemPromptOutcome struct {
 }
 
 // systemAttempt 是一次上游尝试的 system 侧快照，只算一次指纹。
+// mode 是请求入口快照的模式（auto / keep / fold），不随管理员热切换变化：
+// 事件归因与 11128 降级判定都必须用它，而不是请求结束时的实时 Config。
 type systemAttempt struct {
 	started  time.Time
 	keepForm bool
 	fp       string
 	size     int
+	mode     string
 }
 
 func formName(keep bool) string {
@@ -213,7 +216,7 @@ func (s *Service) recordSystemPromptAttempt(
 		AccountID:   account.ID,
 		Site:        site,
 		Model:       opts.Model,
-		Mode:        s.systemPromptMode(),
+		Mode:        att.mode,
 		Form:        formName(att.keepForm),
 		Degraded:    degraded,
 		Fingerprint: att.fp,
