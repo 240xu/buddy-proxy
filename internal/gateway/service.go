@@ -1531,6 +1531,8 @@ func (s *Service) Status() map[string]any {
 		"upstream":    upstream,
 		"watch":       s.WatchStatus(),
 		"concurrency": s.Concurrency.Summary(),
+		// system 提示词策略：auto / keep / fold（管理台 06 面板显示的就是它）。
+		"systemPromptMode": s.systemPromptMode(),
 		"config": map[string]any{
 			"host":                host,
 			"port":                port,
