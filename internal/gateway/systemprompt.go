@@ -216,6 +216,9 @@ func (s *Service) recordSystemPromptAttempt(
 		return
 	}
 	status, code := systemPromptErrorStatus(callErr)
+	// FoldedRetry 表示本次是 11128 降级后的重放；只有重放成功（callErr==nil）
+	// 才算「降级恢复成功」。重放再次失败不置 Recovered。
+	recovered := opts.FoldedRetry && callErr == nil
 	s.RecordSystemPromptEvent(systemprompt.Event{
 		At:          att.started.UnixMilli(),
 		RequestID:   opts.RequestID,
@@ -225,6 +228,7 @@ func (s *Service) recordSystemPromptAttempt(
 		Mode:        att.mode,
 		Form:        formName(att.keepForm),
 		Degraded:    degraded,
+		Recovered:   recovered,
 		Fingerprint: att.fp,
 		SystemLen:   att.size,
 		Status:      status,

@@ -9,13 +9,14 @@ const defaultJournalCapacity = 500
 
 // Stats 是近 24 小时的聚合视图。
 type Stats struct {
-	Total    int `json:"total"`
-	Keep     int `json:"keep"`
-	Fold     int `json:"fold"`
-	Degraded int `json:"degraded"`
-	Blocked  int `json:"blocked"`
-	OK       int `json:"ok"`
-	Failed   int `json:"failed"`
+	Total     int `json:"total"`
+	Keep      int `json:"keep"`
+	Fold      int `json:"fold"`
+	Degraded  int `json:"degraded"`
+	Recovered int `json:"recovered"` // 降级重放成功次数
+	Blocked   int `json:"blocked"`
+	OK        int `json:"ok"`
+	Failed    int `json:"failed"`
 }
 
 // Journal 是保存最近 N 条事件的环形缓冲，供面板实时读取。
@@ -74,9 +75,16 @@ func (j *Journal) Stats24h(now time.Time) Stats {
 	cutoff := now.Add(-24 * time.Hour).UnixMilli()
 	j.mu.RLock()
 	defer j.mu.RUnlock()
+	return statsFrom(j.entries, cutoff)
+}
+
+// statsFrom 是 Stats 的唯一统计口径：cutoff 为 UnixMilli 下界，
+// e.At 小于 cutoff 的事件跳过；cutoff<=0 表示全量统计（供按天落盘统计复用）。
+// Journal.Stats24h 与 Store.StatsForDate 都调它，避免两处口径漂移。
+func statsFrom(events []Event, cutoff int64) Stats {
 	var s Stats
-	for _, e := range j.entries {
-		if e.At < cutoff {
+	for _, e := range events {
+		if cutoff > 0 && e.At < cutoff {
 			continue
 		}
 		s.Total++
@@ -88,6 +96,9 @@ func (j *Journal) Stats24h(now time.Time) Stats {
 		}
 		if e.Degraded {
 			s.Degraded++
+		}
+		if e.Recovered {
+			s.Recovered++
 		}
 		if e.ErrorCode == "11128" {
 			s.Blocked++

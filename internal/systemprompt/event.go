@@ -12,6 +12,7 @@ type Event struct {
 	Mode        string `json:"mode"`                  // auto / keep / fold
 	Form        string `json:"form"`                  // keep / fold
 	Degraded    bool   `json:"degraded,omitempty"`    // 因 11128 降级过
+	Recovered   bool   `json:"recovered,omitempty"`   // 本次是 11128 降级后的重放且成功
 	Fingerprint string `json:"fingerprint,omitempty"` // system 的 SHA-256 前 8 位
 	SystemLen   int    `json:"systemLen"`
 
