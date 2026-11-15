@@ -383,6 +383,12 @@ pre{
 .sp-check{display:inline-flex;align-items:center;gap:6px;font-size:var(--fs-xs);letter-spacing:.12em;text-transform:uppercase;color:var(--fg-40)}
 .sp-check select{min-width:0;font-size:var(--fs-sm);text-transform:none;letter-spacing:0}
 .sp-check input[type="checkbox"]{margin:0}
+/* 三档模式说明：对象、改写前后示例、逐档取舍 */
+#spModeHint{max-width:92ch;line-height:1.7}
+#spModeHint p{margin:10px 0 0}
+#spModeHint ul{margin:8px 0 0;padding-left:22px}
+#spModeHint li{margin:6px 0}
+#spModeHint pre{max-height:none;background:var(--fg-04);border:1px solid var(--fg-10);border-radius:4px;margin:10px 0 0;padding:12px 14px}
 .usage-models{margin-top:16px;overflow:auto;border:1px solid var(--fg-10)}
 .usage-models table{width:100%;border-collapse:collapse;font-size:var(--fs-sm)}
 .usage-models th,.usage-models td{padding:8px 12px;border-bottom:1px solid var(--fg-10);text-align:left}
@@ -1078,20 +1084,34 @@ button:disabled{opacity:.4;cursor:not-allowed}
         </p>
 
         <div class="section-head" style="margin-top:20px;border:none;padding:0">
-          <div class="seg" id="spModeSeg" role="group" aria-label="system 提示词模式">
-            <button type="button" data-mode="auto" class="active">auto · 原样优先</button>
-            <button type="button" data-mode="keep">keep · 永远原样</button>
-            <button type="button" data-mode="fold">fold · 永远折叠</button>
+          <div class="seg" id="spModeSeg" role="group" aria-label="system 提示词处理模式">
+            <button type="button" data-mode="auto" class="active">auto · 先直传，被拒再改写</button>
+            <button type="button" data-mode="keep">keep · 直传 system</button>
+            <button type="button" data-mode="fold">fold · 改写 system</button>
           </div>
           <div class="actions">
             <label class="sp-check"><input type="checkbox" id="spOnlyProblems"/> 只看问题</label>
             <button class="ghost" id="btnRefreshSp" type="button">刷新</button>
           </div>
         </div>
-        <p class="checkin-hint" id="spModeHint">
-          auto：原样优先，上游以 11128 拒收时自动折叠重试一次（不罚号、不换号）。
-          keep：永远原样，被拦截就如实报错。fold：永远折叠成 <code>&lt;client_instructions&gt;</code>。
-        </p>
+        <div class="checkin-hint" id="spModeHint">
+          <p>客户端（Claude Code / opencode 等）发来的请求里，有一条 <code>system</code> 消息，写的是「你是谁、按什么规矩回答」。本开关只决定<strong>网关转发给上游时，这一条消息怎么带过去</strong> —— 跟客户端自己看到什么无关，请求体里的工具定义、空消息、图片等所有消息三档都会照常规整。</p>
+          <p>以 <code>system: "You are Claude Code..."</code> 为例，转给上游时：</p>
+          <pre>直传（keep / auto 首次）
+  [ { role: system, content: "You are Claude Code..." },
+    { role: user,   content: "帮我写个函数" } ]
+
+改写（fold / auto 被拒后重试）
+  [ { role: system, content: "You are a helpful coding assistant." },
+    { role: user,   content: "&lt;client_instructions&gt;\nYou are Claude Code...\n&lt;/client_instructions&gt;\n\n帮我写个函数" } ]</pre>
+          <p>「直传」system 优先级最高，但上游会拒收某个特定的 Claude Code 整句人设；「改写」把人设降级成对话里的建议，换来绝不撞拦截。</p>
+          <ul>
+            <li><strong>auto（默认）</strong>：先直传；万一被上游拒收（错误码 11128），自动改成「改写」再发一次，请求不会失败。日常用这个。</li>
+            <li><strong>keep</strong>：只直传，绝不改写；上游拒收就直接报错，不重试。想严格照 system 执行，或想看真实失败原因时用。</li>
+            <li><strong>fold</strong>：每次都改写，从不直传。批量/自动化、或不在意 system 优先级时用。</li>
+          </ul>
+          <p>技术名 <code>auto / keep / fold</code> 用于 API 与日志；面板「形态」列里的 <code>keep</code>=直传、<code>fold</code>=改写，与此对应。</p>
+        </div>
 
         <div class="metrics">
           <div class="metric"><div class="k">近 24h 事件</div><div class="v" id="spTotal">0</div></div>
