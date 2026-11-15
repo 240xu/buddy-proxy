@@ -31,9 +31,16 @@ const (
 	// 试太多次意义有限；间隔太短则可能撞上同一波故障。
 	DefaultCheckinRetryInterval = 10 * time.Minute
 	DefaultCheckinRetryMax      = 1
-	DefaultIdleConnTimeout      = 90 * time.Second
-	DefaultMaxIdleConns         = 100
-	DefaultMaxIdleConnsPerHost  = 20
+
+	// SystemPromptMode* 控制 system 提示词的处理策略。
+	// auto = 原样优先，命中 11128 时自动降级 fold；keep = 永远原样；fold = 永远折叠。
+	SystemPromptModeAuto = "auto"
+	SystemPromptModeKeep = "keep"
+	SystemPromptModeFold = "fold"
+
+	DefaultIdleConnTimeout     = 90 * time.Second
+	DefaultMaxIdleConns        = 100
+	DefaultMaxIdleConnsPerHost = 20
 )
 
 // APIKeyBinding 将网关 Key 绑定到区域或具体账号；账号绑定的区域由账号推导。
@@ -89,6 +96,8 @@ type Config struct {
 	CheckinRetryInterval time.Duration
 	// CheckinRetryMax 是当天最多重试几次（不含首次尝试，默认 1）。
 	CheckinRetryMax int
+	// SystemPromptMode 是 system 提示词处理策略，取值 auto / keep / fold。
+	SystemPromptMode string
 	// QuotaFloorCredits 是账号积分低于该值时不再参与选号（0 = 不启用）。
 	// 数据源是缓存的 billing credits（QuotaRemaining），与配额耗尽同一口径。
 	QuotaFloorCredits float64
@@ -131,6 +140,7 @@ func Load() Config {
 		CheckinRetryInterval:       envDuration("CODEBUDDY_PROXY_CHECKIN_RETRY_INTERVAL_MS", "", DefaultCheckinRetryInterval),
 		CheckinRetryMax:            envInt("CODEBUDDY_PROXY_CHECKIN_RETRY_MAX", "", DefaultCheckinRetryMax),
 		QuotaFloorCredits:          envFloat("CODEBUDDY_PROXY_QUOTA_FLOOR_CREDITS", 0),
+		SystemPromptMode:           NormalizeSystemPromptMode(firstEnv("CODEBUDDY_PROXY_SYSTEM_PROMPT_MODE")),
 	}
 
 	// 管理台密码为空则开放管理页（本地友好）。
@@ -378,6 +388,30 @@ func OptionalSite(value string) string {
 		return ""
 	}
 	return NormalizeSite(value)
+}
+
+// NormalizeSystemPromptMode 把任意输入归一为三位合法模式之一。
+// 未知值回落 auto（默认行为：原样优先，命中 11128 才降级）。
+func NormalizeSystemPromptMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case SystemPromptModeKeep, "preserve", "passthrough", "1", "true":
+		return SystemPromptModeKeep
+	case SystemPromptModeFold, "0", "false":
+		return SystemPromptModeFold
+	default:
+		return SystemPromptModeAuto
+	}
+}
+
+// IsValidSystemPromptMode 判断是否为精确的合法模式值（不做归一）。
+// 管理台写入前用它拒绝垃圾输入，避免把拼写错误静默成 auto。
+func IsValidSystemPromptMode(value string) bool {
+	switch value {
+	case SystemPromptModeAuto, SystemPromptModeKeep, SystemPromptModeFold:
+		return true
+	default:
+		return false
+	}
 }
 
 // SiteModelPrefix 是模型 ID 上的区域标签（cn / global），供按请求路由。
