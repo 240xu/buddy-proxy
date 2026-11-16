@@ -651,3 +651,39 @@ Access-Control-Allow-Methods: GET,POST,DELETE,OPTIONS
 ```json
 {"error":{"message":"Unsupported route: /v1/models/auto","type":"not_found_error"}}
 ```
+
+---
+
+## system prompt 观测
+
+### `GET /direct-admin/api/system-prompt`
+
+返回当前模式与近期统计。
+
+```json
+{"mode":"strip","statsScope":"date:20261116","stats":{"keep":120,"fold":8,"stripped":44,"recovered":8}}
+```
+
+`mode` 取值：`auto` / `keep` / `fold` / `strip`。
+
+### `POST /direct-admin/api/system-prompt`
+
+热切换模式并写回 `.env`。
+
+```json
+{"mode":"strip"}
+```
+
+非法值返回 `400`：`mode 只能是 auto / keep / fold / strip`。
+
+### `GET /direct-admin/api/system-prompt/events`
+
+按天读取事件。事件新增三个观测字段：
+
+| 字段 | 含义 |
+|---|---|
+| `clientHint` | 从请求头推断的客户端类型（`claude-code` / `opencode` / `deepseek-harness` / `cline` / `cursor` / `codex` / `openai-sdk` / `unknown`）。空表示识别不出。**仅观测，不参与任何决策。** |
+| `sessionSource` | 会话键来源：`header`（客户端显式会话头）/ `cachekey`（`prompt_cache_key`）/ `content`（system+首条 user 哈希）/ `none` |
+| `stripped` / `strippedBytes` | strip 档是否删掉身份句、删了多少字节 |
+
+`stripped` 与 `degraded` 互斥：前者是「定向删一句」，后者是「整条降级」。
