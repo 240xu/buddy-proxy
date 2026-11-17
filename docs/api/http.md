@@ -684,6 +684,7 @@ Access-Control-Allow-Methods: GET,POST,DELETE,OPTIONS
 |---|---|
 | `clientHint` | 从请求头推断的客户端类型（`claude-code` / `opencode` / `deepseek-harness` / `cline` / `cursor` / `codex` / `openai-sdk` / `unknown`）。空表示识别不出。**仅观测，不参与任何决策。** |
 | `sessionSource` | 会话键来源：`header`（客户端显式会话头）/ `cachekey`（`prompt_cache_key`）/ `content`（system+首条 user 哈希）/ `none` |
-| `stripped` / `strippedBytes` | strip 档是否删掉身份句、删了多少字节 |
+| `stripped` / `strippedBytes` | 本次请求是否删掉已知指纹、删了多少字节（`auto` / `strip` 档） |
 
-`stripped` 与 `degraded` 互斥：前者是「定向删一句」，后者是「整条降级」。
+`stripped` 与 `degraded` **不互斥**：`auto` 档先剥离已知指纹，若仍被未知指纹拒收再折叠降级，
+此时同一次请求既带 `stripped` 也带 `degraded`；`degraded` 只描述「是否发生过整条降级」。
